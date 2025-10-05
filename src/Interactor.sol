@@ -8,12 +8,14 @@ import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
 import {ActionConstants} from "@uniswap/v4-periphery/libraries/ActionConstants.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/types/BalanceDelta.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/interfaces/callback/IUnlockCallback.sol";
-import {CurrencyLibrary, Currency} from "@uniswap/v4-core/types/Currency.sol";
+import {Currency} from "@uniswap/v4-core/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract Interactor is IUnlockCallback {
     
+    using SafeERC20 for IERC20;
+
     IPoolManager public poolManager;
     address private currentUser;
 
@@ -71,27 +73,27 @@ contract Interactor is IUnlockCallback {
         address token1 = Currency.unwrap(poolKey.currency1);
 
         if (delta0 < 0) {
-            IERC20(token0).transferFrom(
+            IERC20(token0).safeTransferFrom(
                 currentUser,
                 address(poolManager),
                 uint256(-delta0)
             );
         }
-                if (delta1 < 0) {
-            IERC20(token1).transferFrom(
+        if (delta1 < 0) {
+            IERC20(token1).safeTransferFrom(
                 currentUser,
                 address(poolManager),
                 uint256(-delta1)
             );
         }
         if (delta0 > 0) {
-            IERC20(token0).transfer(
+            IERC20(token0).safeTransfer(
                 currentUser,
                 uint256(delta0)
             );
         }
         if (delta1 > 0) {
-            IERC20(token1).transfer(
+            IERC20(token1).safeTransfer(
                 currentUser,
                 uint256(delta1)
             );
