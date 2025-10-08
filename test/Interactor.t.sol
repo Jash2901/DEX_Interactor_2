@@ -135,6 +135,7 @@ contract InteractorTest is Test {
         vm.stopPrank(); 
 
         uint256 currentBalance = IERC20(token1).balanceOf(poolManager);
+
         deal(token1, poolManager, currentBalance + 1000e18);
 
         vm.startPrank(user); 
