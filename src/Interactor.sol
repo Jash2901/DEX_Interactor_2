@@ -1,118 +1,131 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
-
+ 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {ActionConstants} from "@uniswap/v4-periphery/libraries/ActionConstants.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-
+import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 
 contract Interactor is IUnlockCallback {
-    
     using SafeERC20 for IERC20;
+    using SafeCast for int128;
+    using SafeCast for uint128;
+    using SafeCast for int256;
+    using BalanceDeltaLibrary for BalanceDelta;
     using CurrencyLibrary for Currency;
-
+ 
     IPoolManager public poolManager;
-    address private currentUser;
-
+ 
+    struct SwapExactInputSingleHop {
+        PoolKey poolKey;
+        bool zeroForOne;
+        uint128 amountIn;
+        uint128 amountOutMin;
+    }
+ 
+    modifier onlyPoolManager() {
+        require(msg.sender == address(poolManager), "not pool manager");
+        _;
+    }
+ 
     constructor(address _poolManager) {
         poolManager = IPoolManager(_poolManager);
     }
+ 
+    receive() external payable {}
+ 
+    function unlockCallback(bytes calldata data)
+        external
+        onlyPoolManager
+        returns (bytes memory)
+    {
+        (address msgSender, SwapExactInputSingleHop memory params) =
+            abi.decode(data, (address, SwapExactInputSingleHop));
 
-    function swapExactInputSingle(
-        PoolKey memory poolKey,
-        bool zeroForOne,
-        uint128 amountIn,
-        uint128 amountOutMinimum
-    ) external returns (uint128 amountOut) {
-        if (amountIn == ActionConstants.OPEN_DELTA) {
-            revert("OPEN_DELTA not supported");
-        }
+        BalanceDelta delta = poolManager.swap({
+            key: params.poolKey,
+            params: SwapParams({
+                zeroForOne: params.zeroForOne,
 
-        currentUser = msg.sender;
+                amountSpecified: -(params.amountIn.toInt256()),
 
-        bytes memory data = abi.encode(poolKey, zeroForOne, amountIn, amountOutMinimum);
-        bytes memory result = poolManager.unlock(data);
-
-        currentUser = address(0);
-
-        amountOut = abi.decode(result, (uint128));
-    }
-
-    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
-        require(msg.sender == address(poolManager), "Only poolManager");
-
-        (
-            PoolKey memory poolKey,
-            bool zeroForOne,
-            uint128 amountIn,
-            uint128 amountOutMinimum
-        ) = abi.decode(data, (PoolKey, bool, uint128, uint128));
-
-        int256 amountSpecified = -int256(uint256(amountIn));
-        uint160 sqrtPriceLimitX96 = zeroForOne
-            ? TickMath.MIN_SQRT_PRICE + 1
-            : TickMath.MAX_SQRT_PRICE - 1;
-
-        SwapParams memory params = SwapParams({
-            zeroForOne: zeroForOne,
-            amountSpecified: amountSpecified,
-            sqrtPriceLimitX96: sqrtPriceLimitX96
+                sqrtPriceLimitX96: params.zeroForOne
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            hookData: ""
         });
 
-        BalanceDelta delta = poolManager.swap(poolKey, params, bytes(""));
+        int128 amount0 = delta.amount0();
+        int128 amount1 = delta.amount1();
 
-        int256 delta0 = BalanceDeltaLibrary.amount0(delta);
-        int256 delta1 = BalanceDeltaLibrary.amount1(delta);
-
-        // Settle debts
-        if (delta0 < 0) {
-            // Transfer tokens from user to PoolManager
-            IERC20(Currency.unwrap(poolKey.currency0)).safeTransferFrom(
-                currentUser,
-                address(poolManager),
-                uint256(-delta0)
+        (
+            Currency currencyIn,
+            Currency currencyOut,
+            uint256 amountIn,
+            uint256 amountOut
+        ) = params.zeroForOne
+            ? (
+                params.poolKey.currency0,
+                params.poolKey.currency1,
+                uint128(-amount0) == 0 ? 0 : uint256(uint128(-amount0)),
+                uint128(amount1) == 0 ? 0 : uint256(uint128(amount1))
+            )
+            : (
+                params.poolKey.currency1,
+                params.poolKey.currency0,
+                uint128(-amount1) == 0 ? 0 : uint256(uint128(-amount1)),
+                uint128(amount0) == 0 ? 0 : uint256(uint128(amount0))
             );
-            // Sync the currency
-            poolManager.sync(poolKey.currency0);
-            // Mark as settled
+
+        require(amountOut >= params.amountOutMin, "amount out < min");
+
+        poolManager.take({
+            currency: currencyOut,
+            to: msgSender,
+            amount: amountOut
+        });
+
+        poolManager.sync(currencyIn);
+
+        address unwrappedCurrencyIn = Currency.unwrap(currencyIn);
+        if (unwrappedCurrencyIn == address(0)) {
+            poolManager.settle{value: amountIn}();
+        } else {
+            IERC20(unwrappedCurrencyIn).safeTransfer(address(poolManager), amountIn);
             poolManager.settle();
         }
+
+        return "";
+    }
+ 
+    function swap(SwapExactInputSingleHop calldata params) external payable {
+        Currency currencyIn = params.zeroForOne
+            ? params.poolKey.currency0
+            : params.poolKey.currency1;
+
+        address unwrappedCurrencyIn = Currency.unwrap(currencyIn);
         
-        if (delta1 < 0) {
-            // Transfer tokens from user to PoolManager
-            IERC20(Currency.unwrap(poolKey.currency1)).safeTransferFrom(
-                currentUser,
-                address(poolManager),
-                uint256(-delta1)
-            );
-            poolManager.sync(poolKey.currency1);
-
-            poolManager.settle();
-        }
-
-        if (delta0 > 0) {
-            poolManager.take(poolKey.currency0, currentUser, uint256(delta0));
+        if (unwrappedCurrencyIn != address(0)) {
+            IERC20(unwrappedCurrencyIn).safeTransferFrom(msg.sender, address(this), params.amountIn);
         }
         
-        if (delta1 > 0) {
-            poolManager.take(poolKey.currency1, currentUser, uint256(delta1));
+        poolManager.unlock(abi.encode(msg.sender, params));
+
+        uint256 bal = currencyIn.balanceOf(address(this));
+        if (bal > 0) {
+            if (unwrappedCurrencyIn == address(0)) {
+                (bool success, ) = msg.sender.call{value: bal}("");
+                require(success, "refund failed");
+            } else {
+                IERC20(unwrappedCurrencyIn).safeTransfer(msg.sender, bal);
+            }
         }
-
-        uint128 amountOut = uint128(
-            zeroForOne
-                ? uint256(delta1) // Received token1
-                : uint256(delta0) // Received token0
-        );
-
-        require(amountOut >= amountOutMinimum, "Too little received");
-
-        return abi.encode(amountOut); 
     }
 }
